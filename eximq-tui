@@ -1,53 +1,72 @@
 #!/usr/bin/env python
 #
 # UI for Exim queue management
-#
-# https://github.com/droptune/eximq-tui
-#
 
 import curses
 import re
 import subprocess
 import sys
 from curses import wrapper
+from pathlib import Path
 from platform import system
 from shutil import which
 
+
+# Try to guess exim log file location.
+# Debian/Ubuntu Exim4 default: /var/log/exim4/mainlog
 EXIM_LOG = None
 
-# Try to guess exim log file location
 if EXIM_LOG is None:
-    if system() == 'Linux':
+    if Path("/var/log/exim4/mainlog").exists():
+        EXIM_LOG = "/var/log/exim4/mainlog"
+    elif Path("/var/log/exim/main.log").exists():
         EXIM_LOG = "/var/log/exim/main.log"
-    elif system() == 'FreeBSD':
+    elif system() == "FreeBSD":
         EXIM_LOG = "/var/log/exim/mainlog"
+    else:
+        EXIM_LOG = "/var/log/exim4/mainlog"
 
-# You may redefine controls here
-ENTER_KEY = (curses.KEY_ENTER, 10, 13, ord('m'), ord('M'))
-UP_KEY = (curses.KEY_UP, ord('k'), ord('K'))
-DOWN_KEY = (curses.KEY_DOWN, ord('j'), ord('J'))
-LEFT_KEY = (curses.KEY_LEFT, ord('h'), ord('H'))
-RIGHT_KEY = (curses.KEY_RIGHT, ord('l'), ord('L'))
-NEXT_KEY = (ord('n'), ord('N'))
-PREV_KEY = (ord('p'), ord('P'))
-DELIVER_KEY = (ord('d'), ord('D'))
-DELETE_KEY = (ord('x'), ord('X'))
-VIEW_LOG_KEY = (ord('g'), ord('G'))
-REFRESH_KEY = (ord('R'), ord('r'), curses.KEY_F5)
-HOME_KEY = (curses.KEY_HOME, )
-END_KEY = (curses.KEY_END, )
-F1_KEY = (curses.KEY_F1, )
-MULTIPLE_SELECT_KEY = (32)
-EXIT_KEY = (27, ord('q'), ord('Q'))
 
-re_msg_info = re.compile(r"\s*(\S+)\s+(.+)\s+(.+)\s+<(.*)>")
+# You may redefine controls here.
+ENTER_KEY = (curses.KEY_ENTER, 10, 13, ord("m"), ord("M"))
+UP_KEY = (curses.KEY_UP, ord("k"), ord("K"))
+DOWN_KEY = (curses.KEY_DOWN, ord("j"), ord("J"))
+LEFT_KEY = (curses.KEY_LEFT, ord("h"), ord("H"))
+RIGHT_KEY = (curses.KEY_RIGHT, ord("l"), ord("L"))
+NEXT_KEY = (ord("n"), ord("N"))
+PREV_KEY = (ord("p"), ord("P"))
+DELIVER_KEY = (ord("d"), ord("D"))
+DELETE_KEY = (ord("x"), ord("X"))
+PURGE_KEY = (ord("!"),)
+VIEW_LOG_KEY = (ord("g"), ord("G"))
+REFRESH_KEY = (ord("R"), ord("r"), curses.KEY_F5)
+HOME_KEY = (curses.KEY_HOME,)
+END_KEY = (curses.KEY_END,)
+F1_KEY = (curses.KEY_F1,)
+MULTIPLE_SELECT_KEY = (32,)
+EXIT_KEY = (27, ord("q"), ord("Q"))
+
+
+# Typical exim -bp/-bpr message header:
+#   1h  12K  1abcde-000xyz-Ab  <sender@example>
+# or frozen:
+#   1h  12K  1abcde-000xyz-Ab  *** frozen *** <sender@example>
+#
+# This regex is intentionally compatible with the original parser but also tolerates
+# a frozen marker before the envelope sender.
+re_msg_info = re.compile(r"\s*(\S+)\s+(.+?)\s+(\S{6}-\S{6}-\S{2})(?:\s+\*\*\* frozen \*\*\*)?\s+<(.*)>")
 re_frozen_check = re.compile(r"\*\*\* frozen \*\*\*")
 re_recipient = re.compile(r"^\s+D?\s(\S+)\s*$")
 re_is_delivered = re.compile(r"^\s+D\s\S+")
 
 
+def decode_output(data):
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
 class CursesScreen:
-    """Curses class"""
+    """Curses screen helper."""
+
     current_line = 1
     HELP_HEIGHT = 5
     show_help = False
@@ -77,6 +96,7 @@ class CursesScreen:
     def erase(self):
         self.current_line = 1
         self.box.erase()
+        self.screen.erase()
         self.screen.border(0)
         self.box.border(0)
 
@@ -89,8 +109,8 @@ class CursesScreen:
         self.screen.border(0)
         curses.curs_set(0)
         max_rows, max_cols = self.screen.getmaxyx()
-        self.MAX_BOX_ROW = max_rows - 5 - (self.HELP_HEIGHT if self.show_help else 0)
-        self.MAX_BOX_COLS = max_cols - 6
+        self.MAX_BOX_ROW = max(1, max_rows - 5 - (self.HELP_HEIGHT if self.show_help else 0))
+        self.MAX_BOX_COLS = max(1, max_cols - 6)
         self.box = curses.newwin(self.MAX_BOX_ROW + 2, self.MAX_BOX_COLS + 4, 1, 1)
         self.box.box()
 
@@ -99,7 +119,18 @@ class CursesScreen:
             y = self.current_line
         if color is None:
             color = self.normal_text
-        self.box.addstr(y, x, text, color)
+
+        max_y, max_x = self.box.getmaxyx()
+        if y >= max_y - 1:
+            return
+
+        # Avoid curses.error when text is too wide for the window.
+        safe_text = str(text)[: max(0, max_x - x - 1)]
+        try:
+            self.box.addstr(y, x, safe_text, color)
+        except curses.error:
+            pass
+
         self.current_line += 1
 
     def toggle_help(self):
@@ -121,32 +152,38 @@ class EximQueue:
         queue = []
         current_message = {}
 
-        exim_queue = subprocess.check_output("exim -bpr", shell=True).decode('utf-8').splitlines()
+        try:
+            exim_queue = decode_output(subprocess.check_output(["exim", "-bpr"], stderr=subprocess.STDOUT))
+        except subprocess.CalledProcessError as exc:
+            exim_queue = decode_output(exc.output)
 
         for line in exim_queue:
-            if line != '':
+            if line != "":
                 line_result = re_msg_info.match(line)
                 if line_result:
                     if current_message:
                         queue.append(current_message)
                         current_message = {}
+
                     current_message = {
-                        'time': line_result.group(1),
-                        'size': line_result.group(2),
-                        'id': line_result.group(3),
-                        'from': line_result.group(4),
-                        'mailto': [],
+                        "time": line_result.group(1),
+                        "size": line_result.group(2),
+                        "id": line_result.group(3),
+                        "from": line_result.group(4),
+                        "mailto": [],
                     }
+
                     if re_frozen_check.search(line):
-                        current_message['status'] = '*frozen* '
+                        current_message["status"] = "*frozen* "
                     else:
-                        current_message['status'] = ''
+                        current_message["status"] = ""
+
                     continue
-                else:
-                    line_result = re_recipient.match(line)
-                    is_delivered = 'delivered' if re_is_delivered.match(line) else 'NOT DELIVERED'
-                    if line_result:
-                        current_message['mailto'].append([line_result.group(1), is_delivered])
+
+                line_result = re_recipient.match(line)
+                is_delivered = "delivered" if re_is_delivered.match(line) else "NOT DELIVERED"
+                if line_result and current_message:
+                    current_message["mailto"].append([line_result.group(1), is_delivered])
 
         if current_message:
             queue.append(current_message)
@@ -155,26 +192,60 @@ class EximQueue:
         self.total_messages = len(queue)
         self.selected_message = 0
         self.top_line = 0
+        self.column_shift = 0
 
     def get_selected_msg_id(self):
-        return self.queue[self.selected_message]['id']
+        return self.queue[self.selected_message]["id"]
 
     def get_selected_msg_info(self):
         return self.get_message_info(self.selected_message)
 
     def get_message_info(self, msg_number):
+        mailto = self.queue[msg_number]["mailto"][0][0] if self.queue[msg_number]["mailto"] else "(no recipient parsed)"
         return {
-            'id': self.queue[msg_number]['id'],
-            'from': self.queue[msg_number]['from'],
-            'mailto': self.queue[msg_number]['mailto'][0][0],
-            'time': self.queue[msg_number]['time'],
-            'status': self.queue[msg_number]['status'],
-            'number': msg_number + 1,
-            'total_number': self.total_messages
+            "id": self.queue[msg_number]["id"],
+            "from": self.queue[msg_number]["from"],
+            "mailto": mailto,
+            "time": self.queue[msg_number]["time"],
+            "status": self.queue[msg_number]["status"],
+            "number": msg_number + 1,
+            "total_number": self.total_messages,
         }
 
     def get_selected_msg_mailto(self):
-        return self.queue[self.selected_message]['mailto']
+        return self.queue[self.selected_message]["mailto"]
+
+
+def run_command_lines(args):
+    try:
+        return decode_output(subprocess.check_output(args, stderr=subprocess.STDOUT))
+    except subprocess.CalledProcessError as exc:
+        output = decode_output(exc.output)
+        return output if output else ["Command failed: " + " ".join(args)]
+    except FileNotFoundError:
+        return ["Command not found: " + args[0]]
+    except PermissionError:
+        return ["Permission denied. Try running this tool with sudo."]
+    except Exception as exc:
+        return ["Error: {0}".format(exc)]
+
+def run_command_silent(args):
+    """Run an Exim command without letting stdout/stderr corrupt the curses screen."""
+    try:
+        completed = subprocess.run(
+            args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        return completed.returncode, decode_output(completed.stdout + completed.stderr)
+    except FileNotFoundError:
+        return 127, ["Command not found: " + args[0]]
+    except PermissionError:
+        return 126, ["Permission denied. Try running this tool with sudo."]
+    except Exception as exc:
+        return 1, ["Error: {0}".format(exc)]
+
 
 
 def get_content(exim_q, mode, cur_screen):
@@ -182,27 +253,34 @@ def get_content(exim_q, mode, cur_screen):
     cur_screen.box_string("", 2, None, 2)
     cur_screen.box_refresh()
     msg_id = exim_q.get_selected_msg_id()
-    try:
-        if mode == 'content':
-            message = subprocess.check_output("exim -Mvc {0}".format(msg_id), shell=True).decode('utf-8').splitlines()
-            if message:
-                header = "** Message #{number} of {total_number} {status}from <{from}>, {time} ago. **".format(
-                    **exim_q.get_selected_msg_info())
-                mail_to_list = [
-                    '\t{0} - {1}'.format(address[0], address[1]) for address in exim_q.get_selected_msg_mailto()
-                ]
-                content = [header, '', 'message to:']
-                content.extend(mail_to_list)
-                content.append('')
-                content.extend(message)
-            else:
-                content = ["Message not found"]
-            return content
-        if mode == 'log':
-            return subprocess.check_output("grep -w {0} {1}".format(msg_id, EXIM_LOG), shell=True).decode('utf-8')\
-                .splitlines()
-    except:
-        return ['Error']
+
+    if mode == "content":
+        message = run_command_lines(["exim", "-Mvc", msg_id])
+        if message:
+            header = "** Message #{number} of {total_number} {status}from <{from}>, {time} ago. **".format(
+                **exim_q.get_selected_msg_info()
+            )
+            mail_to_list = [
+                "\t{0} - {1}".format(address[0], address[1])
+                for address in exim_q.get_selected_msg_mailto()
+            ]
+            if not mail_to_list:
+                mail_to_list = ["\t(no recipient parsed)"]
+
+            content = [header, "", "message to:"]
+            content.extend(mail_to_list)
+            content.append("")
+            content.extend(message)
+        else:
+            content = ["Message not found"]
+        return content
+
+    if mode == "log":
+        if not EXIM_LOG or not Path(EXIM_LOG).exists():
+            return ["Log file not found: {0}".format(EXIM_LOG)]
+        return run_command_lines(["grep", "-w", msg_id, EXIM_LOG])
+
+    return ["Unknown mode: {0}".format(mode)]
 
 
 def contents_screen(cur_screen, exim_q, mode):
@@ -211,8 +289,8 @@ def contents_screen(cur_screen, exim_q, mode):
     col_shift = 0
 
     content = get_content(exim_q, mode, cur_screen)
-    max_top_line = len(content) - cur_screen.MAX_BOX_ROW
-    max_line_len = len(max(content, key=len))
+    max_top_line = max(0, len(content) - cur_screen.MAX_BOX_ROW)
+    max_line_len = len(max(content, key=len)) if content else 0
 
     display_content(content, cur_screen, top_line, col_shift)
 
@@ -224,41 +302,49 @@ def contents_screen(cur_screen, exim_q, mode):
         elif key in DELIVER_KEY:
             deliver_message(cur_screen, exim_q)
             break
+        elif key in PURGE_KEY:
+            purge_queue(cur_screen, exim_q)
+            break
         elif key in RIGHT_KEY and max_line_len > max_col and (max_line_len - col_shift) > 2:
             col_shift += 1
         elif key in LEFT_KEY and col_shift > 0:
             col_shift -= 1
         elif key in HOME_KEY:
             top_line, col_shift = 0, 0
-        elif (key in PREV_KEY) and exim_q.selected_message > 0:
+        elif key in PREV_KEY and exim_q.selected_message > 0:
             exim_q.selected_message -= 1
             top_line, col_shift = 0, 0
             content = get_content(exim_q, mode, cur_screen)
-            max_line_len = len(max(content, key=len))
-        elif (key in NEXT_KEY) and exim_q.selected_message < exim_q.total_messages - 1:
+            max_top_line = max(0, len(content) - cur_screen.MAX_BOX_ROW)
+            max_line_len = len(max(content, key=len)) if content else 0
+        elif key in NEXT_KEY and exim_q.selected_message < exim_q.total_messages - 1:
             exim_q.selected_message += 1
             top_line, col_shift = 0, 0
             content = get_content(exim_q, mode, cur_screen)
-            max_line_len = len(max(content, key=len))
+            max_top_line = max(0, len(content) - cur_screen.MAX_BOX_ROW)
+            max_line_len = len(max(content, key=len)) if content else 0
         elif key in UP_KEY and top_line > 0:
             top_line -= 1
         elif key in DOWN_KEY and top_line < max_top_line:
             top_line += 1
-        elif key in VIEW_LOG_KEY and mode != 'log':
-            mode = 'log'
+        elif key in VIEW_LOG_KEY and mode != "log":
+            mode = "log"
             content = get_content(exim_q, mode, cur_screen)
-            max_line_len = len(max(content, key=len))
-        elif key in ENTER_KEY and mode != 'content':
-            mode = 'content'
+            max_top_line = max(0, len(content) - cur_screen.MAX_BOX_ROW)
+            max_line_len = len(max(content, key=len)) if content else 0
+        elif key in ENTER_KEY and mode != "content":
+            mode = "content"
             content = get_content(exim_q, mode, cur_screen)
-            max_line_len = len(max(content, key=len))
+            max_top_line = max(0, len(content) - cur_screen.MAX_BOX_ROW)
+            max_line_len = len(max(content, key=len)) if content else 0
         elif key in REFRESH_KEY:
             content = get_content(exim_q, mode, cur_screen)
-            max_line_len = len(max(content, key=len))
+            max_top_line = max(0, len(content) - cur_screen.MAX_BOX_ROW)
+            max_line_len = len(max(content, key=len)) if content else 0
         elif key == curses.KEY_RESIZE:
             cur_screen.redraw()
             max_col = cur_screen.MAX_BOX_COLS
-            max_top_line = len(content) - cur_screen.MAX_BOX_ROW
+            max_top_line = max(0, len(content) - cur_screen.MAX_BOX_ROW)
             top_line, col_shift = 0, 0
             display_help(cur_screen, exim_q.display_help)
             cur_screen.refresh()
@@ -287,14 +373,96 @@ def display_content(content, cur_screen, top_line, col_shift):
     cur_screen.box_refresh()
 
 
+def confirm_action(cur_screen, prompt):
+    cur_screen.box_clear()
+    cur_screen.box_string(prompt, 2)
+    cur_screen.box_string("Press y to confirm, any other key to cancel.", 2)
+    cur_screen.box_refresh()
+    key = cur_screen.screen.getch()
+    return key in (ord("y"), ord("Y"))
+
+
 def delete_message(cur_screen, exim_q):
+    """Delete the currently selected message immediately, like the original tool."""
     msg_id = exim_q.get_selected_msg_id()
+
     cur_screen.box_clear()
     cur_screen.box_string("Deleting message {0}...".format(msg_id), 2)
     cur_screen.box_string("...", 2)
     cur_screen.box_refresh()
-    subprocess.call(["exim", "-Mrm", msg_id])
+
+    result, output = run_command_silent(["exim", "-Mrm", msg_id])
     exim_q.read_queue()
+
+    cur_screen.box_clear()
+    if result == 0:
+        cur_screen.box_string("Message {0} deleted.".format(msg_id), 2)
+    else:
+        cur_screen.box_string("Deleting message {0} failed with exit code {1}.".format(msg_id, result), 2)
+        if output:
+            cur_screen.box_string(output[0], 2)
+        cur_screen.box_string("Try running this tool with sudo.", 2)
+    cur_screen.box_string("Press any key to continue.", 2)
+    cur_screen.box_refresh()
+    cur_screen.screen.getch()
+
+
+def purge_queue(cur_screen, exim_q):
+    """Delete all currently queued messages after an explicit confirmation."""
+    total = exim_q.total_messages
+
+    if total == 0:
+        cur_screen.box_clear()
+        cur_screen.box_string("No messages in queue.", 2)
+        cur_screen.box_string("Press any key to continue.", 2)
+        cur_screen.box_refresh()
+        cur_screen.screen.getch()
+        return
+
+    cur_screen.box_clear()
+    cur_screen.box_string("PURGE ALL {0} MESSAGE(S) FROM THE EXIM QUEUE?".format(total), 2)
+    cur_screen.box_string("Type YES in uppercase to confirm, anything else cancels.", 2)
+    cur_screen.box_string("> ", 2)
+    cur_screen.box_refresh()
+
+    curses.echo()
+    try:
+        answer = cur_screen.box.getstr(cur_screen.current_line - 1, 4, 8).decode("utf-8", errors="replace")
+    finally:
+        curses.noecho()
+
+    if answer != "YES":
+        cur_screen.box_clear()
+        cur_screen.box_string("Purge cancelled.", 2)
+        cur_screen.box_string("Press any key to continue.", 2)
+        cur_screen.box_refresh()
+        cur_screen.screen.getch()
+        return
+
+    message_ids = [message["id"] for message in exim_q.queue]
+    deleted = 0
+    failed = 0
+
+    cur_screen.box_clear()
+    cur_screen.box_string("Purging {0} message(s)...".format(len(message_ids)), 2)
+    cur_screen.box_refresh()
+
+    for msg_id in message_ids:
+        result, output = run_command_silent(["exim", "-Mrm", msg_id])
+        if result == 0:
+            deleted += 1
+        else:
+            failed += 1
+
+    exim_q.read_queue()
+
+    cur_screen.redraw()
+    cur_screen.box_clear()
+    cur_screen.box_string("Purge complete. Deleted: {0}, failed: {1}.".format(deleted, failed), 2)
+    if failed:
+        cur_screen.box_string("Some deletions failed. Try running this tool with sudo.", 2)
+    cur_screen.box_string("Press any key to continue.", 2)
+    cur_screen.box_refresh()
     cur_screen.screen.getch()
 
 
@@ -304,8 +472,20 @@ def deliver_message(cur_screen, exim_q):
     cur_screen.box_string("Attempting to deliver message {0}...".format(msg_id), 2)
     cur_screen.box_string("...", 2)
     cur_screen.box_refresh()
-    subprocess.call(["exim", "-M", msg_id])
+
+    result, output = run_command_silent(["exim", "-M", msg_id])
     exim_q.read_queue()
+
+    cur_screen.box_clear()
+    if result == 0:
+        cur_screen.box_string("Delivery attempt for {0} triggered.".format(msg_id), 2)
+    else:
+        cur_screen.box_string("Delivery attempt for {0} failed with exit code {1}.".format(msg_id, result), 2)
+        if output:
+            cur_screen.box_string(output[0], 2)
+        cur_screen.box_string("Try running this tool with sudo.", 2)
+    cur_screen.box_string("Press any key to continue.", 2)
+    cur_screen.box_refresh()
     cur_screen.screen.getch()
 
 
@@ -315,44 +495,67 @@ def display_queue(cur_screen, exim_q):
         if exim_q.total_messages == 0:
             cur_screen.box_string("No messages in queue.", 2)
             break
+
+        if message_line_number >= exim_q.total_messages:
+            break
+
+        line = "{number} {id} {status}from <{from}> to {mailto}, {time} ago.".format(
+            **exim_q.get_message_info(message_line_number)
+        )
+
+        if exim_q.column_shift >= len(line):
+            exim_q.column_shift = max(0, len(line) - 1)
+
+        max_col = cur_screen.MAX_BOX_COLS + exim_q.column_shift
+
+        if message_line_number == exim_q.selected_message:
+            cur_screen.box_string(line[exim_q.column_shift:max_col], 2, cur_screen.highlight_text)
         else:
-            line = "{number} {id} {status}from <{from}> to {mailto}, {time} ago.".format(
-                **exim_q.get_message_info(message_line_number))
+            cur_screen.box_string(line[exim_q.column_shift:max_col], 2)
 
-            if exim_q.column_shift >= len(line):
-                exim_q.column_shift = len(line) - 1
+        if message_line_number == exim_q.total_messages - 1:
+            break
 
-            max_col = cur_screen.MAX_BOX_COLS + exim_q.column_shift
 
-            if message_line_number == exim_q.selected_message:
-                cur_screen.box_string(line[exim_q.column_shift:max_col], 2, cur_screen.highlight_text)
-            else:
-                cur_screen.box_string(line[:cur_screen.MAX_BOX_COLS], 2)
-
-            if message_line_number == exim_q.total_messages - 1:
-                break
+def safe_screen_addstr(screen, y, x, text):
+    try:
+        max_y, max_x = screen.getmaxyx()
+        if y < max_y:
+            screen.addstr(y, x, text[: max(0, max_x - x - 1)])
+    except curses.error:
+        pass
 
 
 def display_help(cur_screen, full_help):
     max_box_row = cur_screen.MAX_BOX_ROW
 
     if full_help:
-        cur_screen.screen.addstr(max_box_row + 3, 2,
-                                 "ENTER or M - view message                 N/P - next/previous message")
-        cur_screen.screen.addstr(max_box_row + 4, 2,
-                                 "D - attempt to deliver message            F1 - hide help")
-        cur_screen.screen.addstr(max_box_row + 5, 2, "X - delete message")
-        cur_screen.screen.addstr(max_box_row + 6, 2, "G - grep exim log file for message ID")
-        cur_screen.screen.addstr(max_box_row + 7, 2, "R or F5 - refresh")
-        cur_screen.screen.addstr(max_box_row + 8, 2, "Q - exit              ")
+        safe_screen_addstr(cur_screen.screen, max_box_row + 3, 2,
+                           "ENTER or M - view message                 N/P - next/previous message")
+        safe_screen_addstr(cur_screen.screen, max_box_row + 4, 2,
+                           "D - attempt to deliver message            F1 - hide help")
+        safe_screen_addstr(cur_screen.screen, max_box_row + 5, 2, "X - delete selected message immediately")
+        safe_screen_addstr(cur_screen.screen, max_box_row + 6, 2, "G - grep exim log file for message ID")
+        safe_screen_addstr(cur_screen.screen, max_box_row + 7, 2, "! - purge entire queue, with confirmation   R or F5 - refresh")
+        safe_screen_addstr(cur_screen.screen, max_box_row + 8, 2, "Q or ESC - exit")
     else:
-        cur_screen.screen.addstr(max_box_row + 3, 2, "Press F1 to show help")
+        safe_screen_addstr(cur_screen.screen, max_box_row + 3, 2, "Press F1 to show help")
+
+
+def find_exim_binary():
+    return which("exim") or which("exim4")
 
 
 def main(screen):
-    # Exit if exim binary is not found
-    if not which("exim"):
-        sys.exit(1)
+    exim_bin = find_exim_binary()
+    if not exim_bin:
+        sys.exit("Neither exim nor exim4 binary found in PATH.")
+
+    # The original code calls "exim" directly.
+    # If only exim4 exists, add a lightweight alias by changing PATH is not practical here,
+    # so we warn early. Debian usually provides /usr/sbin/exim.
+    if not which("exim") and which("exim4"):
+        sys.exit("exim4 exists, but exim was not found in PATH. Try: sudo ln -s /usr/sbin/exim4 /usr/local/sbin/exim")
 
     cur_screen = CursesScreen(screen)
     exim_q = EximQueue()
@@ -362,17 +565,16 @@ def main(screen):
     display_help(cur_screen, exim_q.display_help)
     cur_screen.refresh()
 
-    # Enter main loop
     key = screen.getch()
     while key not in EXIT_KEY:
         current_line = exim_q.selected_message - exim_q.top_line
+
         if key in REFRESH_KEY:
             exim_q.read_queue()
         elif key in F1_KEY:
             exim_q.display_help = not exim_q.display_help
             cur_screen.toggle_help()
             cur_screen.redraw()
-        # Ignore other keys if there is no messages in queue
         elif exim_q.total_messages == 0:
             key = screen.getch()
             continue
@@ -380,9 +582,9 @@ def main(screen):
             cur_screen.redraw()
             display_help(cur_screen, exim_q.display_help)
         elif key in ENTER_KEY:
-            contents_screen(cur_screen, exim_q, 'content')
+            contents_screen(cur_screen, exim_q, "content")
         elif key in VIEW_LOG_KEY:
-            contents_screen(cur_screen, exim_q, 'log')
+            contents_screen(cur_screen, exim_q, "log")
         elif (key in DOWN_KEY or key in NEXT_KEY) and exim_q.selected_message < exim_q.total_messages - 1:
             exim_q.selected_message += 1
             exim_q.column_shift = 0
@@ -398,11 +600,11 @@ def main(screen):
             exim_q.column_shift = 0
             if current_line == 0:
                 exim_q.top_line -= 1
-        elif (key in LEFT_KEY) and exim_q.column_shift > 0:
+        elif key in LEFT_KEY and exim_q.column_shift > 0:
             exim_q.column_shift -= 1
         elif key in RIGHT_KEY:
             exim_q.column_shift += 1
-        elif key in HOME_KEY and not exim_q.selected_message == 0:
+        elif key in HOME_KEY and exim_q.selected_message != 0:
             exim_q.column_shift = 0
             exim_q.selected_message = 0
             exim_q.top_line = 0
@@ -410,12 +612,13 @@ def main(screen):
             delete_message(cur_screen, exim_q)
         elif key in DELIVER_KEY:
             deliver_message(cur_screen, exim_q)
+        elif key in PURGE_KEY:
+            purge_queue(cur_screen, exim_q)
         else:
             key = screen.getch()
             continue
 
         cur_screen.box_clear()
-
         display_queue(cur_screen, exim_q)
         display_help(cur_screen, exim_q.display_help)
         cur_screen.refresh()
